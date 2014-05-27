@@ -11,6 +11,7 @@
     AVPlayerItemVideoOutput *playerItemOutput;
     CADisplayLink *displayLink;
     CMTime previousFrameTime, processingFrameTime;
+    CMTime pausedFrameTime;
     CFAbsoluteTime previousActualFrameTime;
     BOOL keepLooping;
 
@@ -39,6 +40,7 @@
 @synthesize playAtActualSpeed = _playAtActualSpeed;
 @synthesize delegate = _delegate;
 @synthesize shouldRepeat = _shouldRepeat;
+@synthesize paused = _paused;
 
 #pragma mark -
 #pragma mark Initialization and teardown
@@ -153,17 +155,29 @@
 
 - (void)startProcessing
 {
+    if (_shouldRepeat) keepLooping = YES;
+    
     if( self.playerItem ) {
         [self processPlayerItem];
         return;
     }
-    if(self.url == nil)
-    {
-      [self processAsset];
-      return;
-    }
     
-    if (_shouldRepeat) keepLooping = YES;
+    if (self.url == nil) {
+        __block GPUImageMovie *weakSelf = self;
+        [_asset loadValuesAsynchronouslyForKeys:[NSArray arrayWithObject:@"tracks"] completionHandler:^{
+            runSynchronouslyOnVideoProcessingQueue(^{
+                NSError *error = nil;
+                AVKeyValueStatus tracksStatus = [_asset statusOfValueForKey:@"tracks" error:&error];
+                if (!tracksStatus == AVKeyValueStatusLoaded) {
+                    return;
+                }
+                
+                [weakSelf processAsset];
+                weakSelf = nil;
+            });
+        }];
+        return;
+    }
     
     previousFrameTime = kCMTimeZero;
     previousActualFrameTime = CFAbsoluteTimeGetCurrent();
@@ -183,6 +197,67 @@
         blockSelf.asset = inputAsset;
         [blockSelf processAsset];
         blockSelf = nil;
+    }];
+}
+
+- (void)pauseProcessing
+{
+    pausedFrameTime = previousFrameTime;
+    _paused = YES;
+    NSLog(@"paused at Time:\n");
+    CMTimeShow(pausedFrameTime);
+    [self cancelProcessing];
+}
+
+- (void)resumeProcessing
+{
+    _paused = NO;
+    if (_shouldRepeat) keepLooping = YES;
+    
+    if( self.playerItem ) {
+        [self processPlayerItem];
+        return;
+    }
+    
+    if(self.url == nil) {
+        GPUImageMovie __block *blockSelf = self;
+        
+        [_asset loadValuesAsynchronouslyForKeys:[NSArray arrayWithObject:@"tracks"] completionHandler:
+         ^{
+             runSynchronouslyOnVideoProcessingQueue(^{
+                 NSError *error = nil;
+                 AVKeyValueStatus tracksStatus = [_asset statusOfValueForKey:@"tracks" error:&error];
+                 if (!tracksStatus == AVKeyValueStatusLoaded)
+                 {
+                     return;
+                 }
+                 [blockSelf processAsset];
+                 blockSelf = nil;
+             });
+         }];
+        return;
+    }
+    
+    previousFrameTime = pausedFrameTime;
+    previousActualFrameTime = CFAbsoluteTimeGetCurrent();
+    
+    NSDictionary *inputOptions = [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES] forKey:AVURLAssetPreferPreciseDurationAndTimingKey];
+    AVURLAsset *inputAsset = [[AVURLAsset alloc] initWithURL:self.url options:inputOptions];
+    
+    GPUImageMovie __block *blockSelf = self;
+    
+    [inputAsset loadValuesAsynchronouslyForKeys:[NSArray arrayWithObject:@"tracks"] completionHandler: ^{
+        runSynchronouslyOnVideoProcessingQueue(^{
+            NSError *error = nil;
+            AVKeyValueStatus tracksStatus = [inputAsset statusOfValueForKey:@"tracks" error:&error];
+            if (!tracksStatus == AVKeyValueStatusLoaded)
+            {
+                return;
+            }
+            blockSelf.asset = inputAsset;
+            [blockSelf processAsset];
+            blockSelf = nil;
+        });
     }];
 }
 
@@ -219,6 +294,12 @@
 - (void)processAsset
 {
     reader = [self createAssetReader];
+    
+    if (CMTIME_IS_VALID(pausedFrameTime)) {
+        reader.timeRange = CMTimeRangeMake(pausedFrameTime, kCMTimePositiveInfinity);
+    } else {
+        reader.timeRange = CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+    }
 
     AVAssetReaderOutput *readerVideoTrackOutput = nil;
     AVAssetReaderOutput *readerAudioTrackOutput = nil;
